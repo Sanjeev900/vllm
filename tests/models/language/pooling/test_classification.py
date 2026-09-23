@@ -11,6 +11,13 @@ from vllm.platforms import current_platform
     "model",
     [
         pytest.param(
+            "distilbert/distilbert-base-uncased-finetuned-sst-2-english",
+            marks=[
+                pytest.mark.core_model,
+                pytest.mark.cpu_model,
+            ],
+        ),
+        pytest.param(
             "jason9693/Qwen2.5-1.5B-apeach",
             marks=[
                 pytest.mark.core_model,
