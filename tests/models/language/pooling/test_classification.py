@@ -59,6 +59,27 @@ def test_models(
 
 
 @pytest.mark.core_model
+@pytest.mark.cpu_model
+def test_distilbert_sentiment_direction(vllm_runner) -> None:
+    """Verify that the SST-2 model assigns higher probability to the correct
+    sentiment label: label 1 = POSITIVE, label 0 = NEGATIVE."""
+    model = "distilbert/distilbert-base-uncased-finetuned-sst-2-english"
+    positive = "I love this movie, it was absolutely fantastic!"
+    negative = "This was a terrible experience, completely disappointing."
+
+    with vllm_runner(model, max_model_len=512, dtype="float") as vllm_model:
+        outputs = vllm_model.classify([positive, negative])
+
+    pos_probs = torch.tensor(outputs[0])
+    neg_probs = torch.tensor(outputs[1])
+
+    # label 1 = POSITIVE: positive sentence must score higher on label 1
+    assert pos_probs[1] > pos_probs[0], "Expected POSITIVE label for positive sentence"
+    # label 0 = NEGATIVE: negative sentence must score higher on label 0
+    assert neg_probs[0] > neg_probs[1], "Expected NEGATIVE label for negative sentence"
+
+
+@pytest.mark.core_model
 def test_bert_model_runner_v2(hf_runner, vllm_runner, monkeypatch) -> None:
     model = "cross-encoder/ms-marco-TinyBERT-L-2-v2"
     score_inputs = (

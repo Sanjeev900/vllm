@@ -259,6 +259,7 @@ class DistilBertClassificationHead(nn.Module):
         self.classifier = nn.Linear(config.dim, config.num_labels, dtype=head_dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # HF also applies dropout here, but it is a no-op at inference time.
         x = self.pre_classifier(x)
         x = torch.relu(x)
         return self.classifier(x)
