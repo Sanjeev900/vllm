@@ -66,6 +66,7 @@ from vllm.model_executor.models.transformers.fusers.attention import (
 from vllm.model_executor.models.transformers.utils import (
     attrsetter,
     can_enable_torch_compile,
+    disable_noop_dynamic_rope,
     get_feature_request_tip,
     init_on_device_without_buffers,
     log_replacement,
@@ -182,6 +183,8 @@ class Base(
         self._create_hf_to_vllm_mapper()
         # Remove layers not on this pipeline parallel rank
         self.pipeline_parallel()
+        # Skip the device sync of dynamic rope where it can never rescale
+        disable_noop_dynamic_rope(self.model.get_decoder(), vllm_config)
         # Substitute remaining layers with vLLM's layers as needed
         self.recursive_replace()
         # Create attention instances for KV cache allocation
@@ -282,6 +285,7 @@ class Base(
             dynamic_arg_dims=dynamic_arg_dims,
             enable_if=enable_if,
             is_encoder=is_encoder,
+            use_aot_compile=False,
         )(cls)
 
     def _decorate_for_torch_compile(self):
@@ -501,6 +505,8 @@ class Base(
 
         orig_to_new_stacked: dict[str, tuple[str, ShardId]] = {}
 
+        unindexed_attention: list[tuple[str, AttentionFuser]] = []
+
         def register_fusion(fuser: BaseFuser, prefix: str, module: nn.Module):
             """Register a fused layer's mappings just before it is built."""
             self.fusers.setdefault(prefix, []).append(fuser)
@@ -517,6 +523,8 @@ class Base(
                         "layer cannot serve."
                     )
                 self.attention_fusers[index] = (prefix, fuser)
+            elif isinstance(fuser, AttentionFuser):
+                unindexed_attention.append((prefix, fuser))
 
             orig_to_new_stacked.update(fuser.orig_to_new_stacked(prefix))
 
@@ -544,7 +552,7 @@ class Base(
                         "num_nextn_predict_layers",  # Most models
                         "mtp_num_hidden_layers",  # Qwen 3.5
                     )
-                    n_predict = getattr_iter(self.text_config, names, 0)
+                    n_predict = getattr_iter(self.text_config, names, 0) or 0
                     for i in range(num_hidden_layers, num_hidden_layers + n_predict):
                         mtp_prefix = f"{prefix}.{i}."
                         if mtp_prefix not in self.ignore_unexpected_prefixes:
@@ -584,8 +592,32 @@ class Base(
                     log_replacement(qual_name, child_module, new_module)
 
         _recursive_replace(self.model, prefix="model")
+        self._register_unindexed_attention(unindexed_attention)
 
         self.hf_to_vllm_mapper |= WeightsMapper(orig_to_new_stacked=orig_to_new_stacked)
+
+    def _register_unindexed_attention(
+        self, unindexed: list[tuple[str, AttentionFuser]]
+    ):
+        """Assign attention modules without a `layer_idx` to the layer they sit in.
+
+        Some models (e.g. DistilBERT) do not store `layer_idx` on their attention
+        module. A layer is only filled this way if no module with a `layer_idx`
+        already serves it and exactly one unindexed module sits in it, so
+        models that declare `layer_idx` are never affected.
+        """
+        candidates: dict[int, list[tuple[str, AttentionFuser]]] = {}
+        for prefix, fuser in unindexed:
+            name = prefix.removeprefix("model.")
+            layer = next(
+                (i for i, n in self._layer_names.items() if name.startswith(f"{n}.")),
+                None,
+            )
+            if layer is not None:
+                candidates.setdefault(layer, []).append((prefix, fuser))
+        for layer, found in candidates.items():
+            if layer not in self.attention_fusers and len(found) == 1:
+                self.attention_fusers[layer] = found[0]
 
     def _create_attention_instances(self, prefix: str = ""):
         """Create `Attention` instances to inform KV cache allocation."""

@@ -613,7 +613,7 @@ def build_marked_model(
     [(0, 0, True), (4, 0, False), (0, 4, False)],
 )
 def test_tower_weights_skipped_when_modality_disabled(
-    image_limit, video_limit, skipped
+    image_limit, video_limit, skipped, tp_init
 ):
     """Only `--limit-mm-per-prompt image=0,video=0` drops the tower they share."""
     vision_tower = build_marked_model(image_limit, video_limit).vision_tower
@@ -723,6 +723,57 @@ def test_attention_dispatch_is_required(monkeypatch: pytest.MonkeyPatch):
         match="Layer 0 does not dispatch through the Transformers attention interface",
     ):
         Base._create_attention_instances(model)
+
+
+@pytest.mark.parametrize(
+    ("unindexed", "existing", "expected"),
+    [
+        pytest.param(
+            ["model.transformer.layer.0.attention"],
+            {},
+            {0: "model.transformer.layer.0.attention"},
+            id="single-candidate-registers",
+        ),
+        pytest.param(
+            ["model.transformer.layer.0.attention", "model.transformer.layer.0.cross"],
+            {},
+            {},
+            id="ambiguous-candidates-stay-unregistered",
+        ),
+        pytest.param(
+            ["model.transformer.layer.0.attention"],
+            {0: "model.transformer.layer.0.indexed"},
+            {0: "model.transformer.layer.0.indexed"},
+            id="indexed-registration-is-preserved",
+        ),
+        pytest.param(
+            ["model.transformer.layer.10.attention"],
+            {},
+            {10: "model.transformer.layer.10.attention"},
+            id="layer-1-does-not-match-layer-10",
+        ),
+        pytest.param(
+            ["model.encoder.attention"],
+            {},
+            {},
+            id="path-outside-the-layers-is-ignored",
+        ),
+    ],
+)
+def test_unindexed_attention_registration(
+    unindexed: list[str], existing: dict[int, str], expected: dict[int, str]
+):
+    """An attention module without `layer_idx` is assigned to the layer it sits in,
+    but only when that is unambiguous and no indexed module already serves it."""
+    fuser = object()
+    model = SimpleNamespace(
+        _layer_names={i: f"transformer.layer.{i}" for i in range(11)},
+        attention_fusers={i: (prefix, fuser) for i, prefix in existing.items()},
+    )
+
+    Base._register_unindexed_attention(model, [(p, fuser) for p in unindexed])
+
+    assert {i: p for i, (p, _) in model.attention_fusers.items()} == expected
 
 
 @pytest.mark.parametrize("model_type", ATTENTION_MODEL_TYPES)
